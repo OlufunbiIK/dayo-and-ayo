@@ -152,6 +152,364 @@ const mono = `${C.bride[0]}&${C.groom[0]}`;
 const maps = (q: string) =>
   `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q + ", Abuja")}`;
 
+/* ═════════ Voice: say your RSVP, and leave a voice-note gift ═════════ */
+const MOVE_NAMES = [
+  "Legwork",
+  "Shaku shaku",
+  "Zanku",
+  "Whine small",
+  "I'm here for pictures",
+  "I'm here for the food",
+];
+type Speech = {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  start: () => void;
+  stop: () => void;
+  onresult: ((e: any) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((e: any) => void) | null;
+}; // eslint-disable-line @typescript-eslint/no-explicit-any
+const speechApi = (): (new () => Speech) | null =>
+  typeof window === "undefined"
+    ? null
+    : (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition ||
+      null; // eslint-disable-line @typescript-eslint/no-explicit-any
+export type VoiceFill = {
+  name?: string;
+  coming?: "yes" | "no";
+  seats?: number;
+  days?: string[];
+  phone?: string;
+  move?: string;
+  wish?: string;
+};
+
+function VoiceRsvp({ onFill }: { onFill: (p: VoiceFill) => void }) {
+  const [ok, setOk] = useState(false);
+  const [state, setState] = useState<
+    "idle" | "listening" | "thinking" | "error"
+  >("idle");
+  const [heard, setHeard] = useState("");
+  const [msg, setMsg] = useState("");
+  const rec = useRef<Speech | null>(null);
+  const said = useRef("");
+  useEffect(() => {
+    setOk(!!speechApi());
+    return () => rec.current?.stop();
+  }, []);
+  if (!ok) return null;
+
+  const understand = async (text: string) => {
+    setState("thinking");
+    try {
+      const res = await fetch("/api/voice-rsvp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          events: C.events.map((e) => e.title),
+          moves: MOVE_NAMES,
+        }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error();
+      setState("idle");
+      onFill(d.rsvp || {});
+    } catch {
+      setState("error");
+      setMsg("Voice is having a moment. Tap through instead 🤍");
+    }
+  };
+  const start = () => {
+    const Api = speechApi();
+    if (!Api) return;
+    const r = new Api();
+    r.lang = "en-NG";
+    r.interimResults = true;
+    r.continuous = true;
+    said.current = "";
+    setHeard("");
+    setMsg("");
+    let final = "";
+    r.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += t + " ";
+        else interim += t;
+      }
+      said.current = (final + interim).trim();
+      setHeard(said.current);
+    };
+    r.onerror = (e) => {
+      setState("error");
+      setMsg(
+        e?.error === "not-allowed"
+          ? "Please allow the microphone, then try again 🎙️"
+          : "I didn't catch that. Try again?",
+      );
+    };
+    r.onend = () => {
+      rec.current = null;
+      if (said.current) understand(said.current);
+      else setState((s) => (s === "listening" ? "idle" : s));
+    };
+    rec.current = r;
+    r.start();
+    setState("listening");
+  };
+
+  return (
+    <div className={`voice-rsvp ${state}`}>
+      <p className="vr-or">
+        <span>or</span>
+      </p>
+      <button
+        type="button"
+        className={`mic-btn ${state === "listening" ? "on" : ""}`}
+        onClick={state === "listening" ? () => rec.current?.stop() : start}
+        disabled={state === "thinking"}
+      >
+        <span className="mic-dot">
+          {state === "thinking" ? (
+            <span className="spin" />
+          ) : state === "listening" ? (
+            "■"
+          ) : (
+            "🎙️"
+          )}
+        </span>
+        {state === "listening"
+          ? "Done talking"
+          : state === "thinking"
+            ? "Filling it in…"
+            : "Just say it"}
+      </button>
+      {state === "listening" || state === "thinking" ? (
+        <p className="vr-heard">{heard || "Listening… 👂🏾"}</p>
+      ) : (
+        <p className="vr-hint">
+          e.g. &ldquo;It&rsquo;s Tolu, I dey come with my wife for the vows and
+          the party. 0805 036 6355. Una go last!&rdquo;
+        </p>
+      )}
+      {msg && <p className="vr-msg">{msg}</p>}
+    </div>
+  );
+}
+
+function VoiceNote({ code, name }: { code: string; name: string }) {
+  const MAX = 30;
+  const [ok, setOk] = useState(false);
+  const [st, setSt] = useState<"idle" | "rec" | "review" | "sending" | "sent">(
+    "idle",
+  );
+  const [secs, setSecs] = useState(0);
+  const [url, setUrl] = useState("");
+  const [bars, setBars] = useState<number[]>(() => Array(14).fill(0.15));
+  const [msg, setMsg] = useState("");
+  const rec = useRef<MediaRecorder | null>(null);
+  const blob = useRef<Blob | null>(null);
+  const cleanup = useRef<() => void>(() => {});
+  useEffect(() => {
+    setOk(
+      !!navigator.mediaDevices?.getUserMedia &&
+        typeof MediaRecorder !== "undefined",
+    );
+    return () => cleanup.current();
+  }, []);
+  if (!ok) return null;
+
+  const start = async () => {
+    setMsg("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find(
+        (t) => MediaRecorder.isTypeSupported(t),
+      );
+      const r = new MediaRecorder(
+        stream,
+        type ? { mimeType: type } : undefined,
+      );
+      const chunks: Blob[] = [];
+      r.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data);
+      };
+      const ctx = new AudioContext();
+      const an = ctx.createAnalyser();
+      an.fftSize = 64;
+      ctx.createMediaStreamSource(stream).connect(an);
+      const buf = new Uint8Array(an.frequencyBinCount);
+      let raf = 0;
+      const draw = () => {
+        an.getByteFrequencyData(buf);
+        setBars(
+          Array.from({ length: 14 }, (_, i) =>
+            Math.max(0.15, buf[i + 1] / 255),
+          ),
+        );
+        raf = requestAnimationFrame(draw);
+      };
+      draw();
+      const t0 = Date.now();
+      const tick = setInterval(() => {
+        const s = Math.floor((Date.now() - t0) / 1000);
+        setSecs(s);
+        if (s >= MAX && r.state === "recording") r.stop();
+      }, 200);
+      cleanup.current = () => {
+        cancelAnimationFrame(raf);
+        clearInterval(tick);
+        stream.getTracks().forEach((t) => t.stop());
+        ctx.close().catch(() => {});
+      };
+      r.onstop = () => {
+        cleanup.current();
+        blob.current = new Blob(chunks, {
+          type: r.mimeType || type || "audio/webm",
+        });
+        setUrl(URL.createObjectURL(blob.current));
+        setSt("review");
+      };
+      rec.current = r;
+      r.start(250);
+      setSecs(0);
+      setSt("rec");
+    } catch {
+      setMsg("Please allow the microphone to record 🎙️");
+    }
+  };
+  const stop = () => {
+    if (rec.current?.state === "recording") rec.current.stop();
+  };
+  const redo = () => {
+    if (url) URL.revokeObjectURL(url);
+    setUrl("");
+    blob.current = null;
+    setSt("idle");
+  };
+  const send = async () => {
+    if (!blob.current) return;
+    setSt("sending");
+    setMsg("");
+    const fd = new FormData();
+    fd.append("code", code);
+    fd.append("audio", blob.current, "voice-note");
+    try {
+      const d = await fetch("/api/voice-note", {
+        method: "POST",
+        body: fd,
+      }).then((r) => r.json());
+      if (!d.ok) throw new Error(d.error);
+      setSt("sent");
+    } catch (e) {
+      setSt("review");
+      setMsg(
+        e instanceof Error && e.message
+          ? e.message
+          : "Couldn't send. Try again?",
+      );
+    }
+  };
+
+  return (
+    <div className={`vnote ${st}`}>
+      {st === "sent" ? (
+        <>
+          <div className="vn-gift" aria-hidden="true">
+            🎁
+          </div>
+          <p className="vn-t">Voice gift wrapped!</p>
+          <p className="vn-s">
+            {C.bride} &amp; {C.groom} will unwrap it after the wedding 🤍
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="vn-t">🎙️ Leave them a voice-note gift</p>
+          <p className="vn-s">
+            {name ? `${name.split(" ")[0]}, scream` : "Scream"}, sing, pray or
+            toast. They&rsquo;ll hear it after the wedding.
+          </p>
+          {st === "idle" && (
+            <div className="vn-ideas">
+              {[
+                "🎉 Shout your congrats",
+                "🎤 Sing them a line",
+                "🥂 Make a toast",
+                "😂 A funny memory",
+              ].map((x) => (
+                <span key={x}>{x}</span>
+              ))}
+            </div>
+          )}
+          {st === "rec" && (
+            <>
+              <div className="vn-bars" aria-hidden="true">
+                {bars.map((v, i) => (
+                  <i key={i} style={{ transform: `scaleY(${v})` }} />
+                ))}
+              </div>
+              <p className="vn-time">
+                <span className="rec-dot" /> 0:{String(secs).padStart(2, "0")}{" "}
+                <small>/ 0:{MAX}</small>
+              </p>
+            </>
+          )}
+          {(st === "review" || st === "sending") && (
+            <audio className="vn-play" src={url} controls />
+          )}
+          {msg && <p className="vr-msg">{msg}</p>}
+          {st === "idle" && (
+            <button type="button" className="mic-btn big" onClick={start}>
+              <span className="mic-dot">🎙️</span>Tap to record
+            </button>
+          )}
+          {st === "rec" && (
+            <button
+              type="button"
+              className="mic-btn big on"
+              onClick={stop}
+              disabled={secs < 1}
+            >
+              <span className="mic-dot">■</span>Stop
+            </button>
+          )}
+          {(st === "review" || st === "sending") && (
+            <div className="vn-actions">
+              <button
+                type="button"
+                className="btn"
+                onClick={send}
+                disabled={st === "sending"}
+              >
+                {st === "sending" ? (
+                  <>
+                    <span className="spin" /> Wrapping…
+                  </>
+                ) : (
+                  "Wrap it & send 🎁"
+                )}
+              </button>
+              <button
+                type="button"
+                className="backlink"
+                onClick={redo}
+                disabled={st === "sending"}
+              >
+                Record again
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 /* Soft rose-gold sparkles */
 function Sparkle({ count = 40 }: { count?: number }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -305,6 +663,7 @@ export default function Invite() {
     wish: "",
   });
   const savedRsvp = useRef("");
+  const [rsvpCode, setRsvpCode] = useState("");
   const [rStep, setRStep] = useState(0);
   const [sent, setSent] = useState(false);
   const [realNote, setRealNote] = useState(false);
@@ -515,8 +874,52 @@ export default function Invite() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
-    }).catch(() => {});
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.code) setRsvpCode(d.code);
+      })
+      .catch(() => {});
   }, [cur, rsvp]);
+  // Voice RSVP: fill in whatever the guest said, then jump to the first question still unanswered.
+  const fillFromVoice = (p: VoiceFill) => {
+    const days = Array.isArray(p.days)
+      ? p.days.filter((d) => C.events.some((e) => e.title === d))
+      : [];
+    const phone = typeof p.phone === "string" ? cleanPhone(p.phone) : "";
+    const merged = {
+      ...rsvp,
+      ...(typeof p.name === "string" && p.name.trim()
+        ? { name: p.name.trim().slice(0, 40) }
+        : {}),
+      ...(p.coming === "yes" || p.coming === "no" ? { coming: p.coming } : {}),
+      ...(p.seats === 1 || p.seats === 2 ? { seats: p.seats } : {}),
+      ...(days.length ? { days } : {}),
+      ...(phone ? { phone, network: guessNet(phone) || rsvp.network } : {}),
+      ...(typeof p.move === "string" && p.move.trim()
+        ? { move: p.move.trim().slice(0, 40) }
+        : {}),
+      ...(typeof p.wish === "string" && p.wish.trim()
+        ? { wish: p.wish.trim().slice(0, 200) }
+        : {}),
+    };
+    setRsvp(merged);
+    const order =
+      merged.coming === "no"
+        ? ["name", "coming", "phone", "wish", "done"]
+        : ["name", "coming", "phone", "seats", "days", "move", "wish", "done"];
+    const missing: Record<string, boolean> = {
+      name: !merged.name,
+      coming: !merged.coming,
+      phone: !merged.phone || !merged.network,
+      seats: p.seats !== 1 && p.seats !== 2,
+      days: !merged.days.length,
+      move: !merged.move,
+      wish: !merged.wish,
+    };
+    const first = order.findIndex((st) => missing[st]);
+    setRStep(first === -1 ? order.length - 1 : first);
+  };
   const sendRsvp = () => {
     const lines =
       rsvp.coming === "yes"
@@ -917,6 +1320,7 @@ export default function Invite() {
                   >
                     That&rsquo;s me →
                   </button>
+                  <VoiceRsvp onFill={fillFromVoice} />
                 </form>
               )}
 
@@ -1177,6 +1581,7 @@ export default function Invite() {
                       Opened in WhatsApp. Just tap send!
                     </p>
                   )}
+                  {rsvpCode && <VoiceNote code={rsvpCode} name={rsvp.name} />}
                 </div>
               )}
             </div>
