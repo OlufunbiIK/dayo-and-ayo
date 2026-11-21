@@ -197,7 +197,7 @@ function VoiceRsvp({ onFill }: { onFill: (p: VoiceFill) => void }) {
   const rec = useRef<Speech | null>(null);
   const said = useRef("");
   useEffect(() => {
-    setOk(!!speechApi());
+    setOk(!!speechApi() && process.env.NEXT_PUBLIC_VOICE_RSVP === "on");
     return () => rec.current?.stop();
   }, []);
   if (!ok) return null;
